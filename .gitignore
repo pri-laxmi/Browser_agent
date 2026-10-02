@@ -1,0 +1,11 @@
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.browser-profile/
+settings.json
+**/settings.json
+.env
+.env.*
+!.env.example
+.DS_Store

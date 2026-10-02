@@ -1,0 +1,12 @@
+{
+  "name": "browser-pilot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c green,cyan \"npm --prefix server run dev\" \"npm --prefix web run dev\"",
+    "build": "npm --prefix server run build && npm --prefix web run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
