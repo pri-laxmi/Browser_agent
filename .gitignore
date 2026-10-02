@@ -3,6 +3,8 @@ node_modules/
 dist/
 **/dist/
 .browser-profile/
+.browser-pilot-settings.json
+.browser-pilot-history.json
 settings.json
 **/settings.json
 .env
