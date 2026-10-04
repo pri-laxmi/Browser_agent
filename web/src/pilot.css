@@ -167,7 +167,7 @@ p { margin: 0; }
 .modal-heading h2 { font-size: 20px; font-weight: 600; }
 .icon-button { width: 31px; height: 31px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--panel-soft); cursor: pointer; }
 .field-label,.form-field > span { display: block; margin-bottom: 7px; color: var(--muted); font-size: 10px; font-weight: 600; }
-.provider-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 16px; padding: 4px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
+.provider-toggle { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 4px; margin-bottom: 16px; padding: 4px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
 .provider-toggle button { min-height: 34px; border: 1px solid transparent; border-radius: 6px; color: var(--muted); background: transparent; font-size: 11px; cursor: pointer; }
 .provider-toggle button.is-active { border-color: var(--line-strong); color: var(--text); background: var(--panel); box-shadow: 0 2px 8px rgba(0,0,0,.12); }
 .form-field { display: block; margin-top: 14px; }
