@@ -25,7 +25,7 @@ type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
 type BrowserSnapshot = { url: string; title: string; image: string; capturedAt: number }
 type AgentEvent = { type: 'step' | 'summary'; description: string; status: 'thinking' | 'running' | 'waiting' | 'done' | 'denied' | 'failed'; interaction?: 'approval' | 'login' | 'question'; timestamp: number; step?: number }
 type HistoryEntry = { id: string; task: string; status: 'running' | 'completed' | 'failed' | 'stopped'; summary?: string; createdAt: number; updatedAt: number }
-type ModelSettings = { provider: 'openrouter' | 'local'; baseUrl: string; model: string; apiKey: string }
+type ModelSettings = { provider: 'openrouter' | 'groq' | 'local'; baseUrl: string; model: string; apiKey: string }
 
 const apiBase = `${import.meta.env.VITE_API_URL ?? ''}/api`
 const examples = ['Find the top story on Hacker News and summarize it', 'Compare these two product pages', 'Find a quiet hotel in Copenhagen']
@@ -58,6 +58,7 @@ function App() {
   const [snapshot, setSnapshot] = useState<BrowserSnapshot | null>(null)
   const [modelConfigured, setModelConfigured] = useState(false)
   const [settings, setSettings] = useState<ModelSettings>(emptySettings)
+  const [savedProvider, setSavedProvider] = useState<ModelSettings['provider'] | null>(null)
   const [settingsMessage, setSettingsMessage] = useState('')
   const [settingsBusy, setSettingsBusy] = useState(false)
   const [history, setHistory] = useState<HistoryEntry[]>([])
@@ -79,6 +80,7 @@ function App() {
       api<ModelSettings | null>('/settings').then((value) => {
         if (value) {
           setModelConfigured(true)
+          setSavedProvider(value.provider)
           setSettings({ ...value, apiKey: '' })
         }
       }).catch(() => undefined),
@@ -243,6 +245,7 @@ function App() {
     try {
       await api('/settings', { method: 'PUT', body: JSON.stringify(settings) })
       setModelConfigured(true)
+      setSavedProvider(settings.provider)
       setSettings({ ...settings, apiKey: '' })
       setSettingsMessage('Settings saved on this device.')
     } catch (error) {
@@ -311,7 +314,7 @@ function App() {
             <div className="example-tasks" aria-label="Example tasks">{examples.map((example, index) => <button key={example} className="example-chip" onClick={() => setCommand(example)}><span className="example-number">0{index + 1}</span><span>{example}</span><ArrowUpRight size={14} /></button>)}</div>
           </section>
 
-          {!modelConfigured && <button className="model-hint" onClick={() => setSettingsOpen(true)}><Sparkles size={15} /><span><strong>No model configured.</strong> Choose OpenRouter or a local Ollama/LM Studio model to begin.</span><ArrowUpRight size={14} /></button>}
+          {!modelConfigured && <button className="model-hint" onClick={() => setSettingsOpen(true)}><Sparkles size={15} /><span><strong>No model configured.</strong> Choose Groq, OpenRouter, or a local Ollama/LM Studio model to begin.</span><ArrowUpRight size={14} /></button>}
           {statusMessage && <div className={`connection-message ${status === 'error' ? 'is-error' : ''}`}>{statusMessage}<button aria-label="Dismiss message" onClick={() => setStatusMessage('')}><X size={14} /></button></div>}
 
           <div className="workspace-grid">
@@ -367,8 +370,12 @@ function App() {
           <div className="modal-heading"><div><span className="eyebrow"><span className="eyebrow-line" /> MODEL CONNECTION</span><h2 id="settings-title">Settings</h2></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div>
           <form onSubmit={(event) => void saveSettings(event)}>
             <label className="field-label">Provider</label>
-            <div className="provider-toggle"><button type="button" className={settings.provider === 'openrouter' ? 'is-active' : ''} onClick={() => setSettings({ ...settings, provider: 'openrouter', baseUrl: settings.provider === 'openrouter' ? settings.baseUrl : 'https://openrouter.ai/api/v1', model: settings.provider === 'openrouter' ? settings.model : 'openai/gpt-4o-mini' })}>OpenRouter</button><button type="button" className={settings.provider === 'local' ? 'is-active' : ''} onClick={() => setSettings({ ...settings, provider: 'local', baseUrl: settings.provider === 'local' ? settings.baseUrl : 'http://localhost:11434/v1', model: settings.provider === 'local' ? settings.model : 'llama3.2:3b' })}>Local model</button></div>
-            {settings.provider === 'openrouter' && <label className="form-field"><span>API key</span><input type="password" autoComplete="new-password" placeholder={modelConfigured ? 'Saved key retained when blank' : 'sk-or-...'} value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} /></label>}
+            <div className="provider-toggle">
+              <button type="button" className={settings.provider === 'groq' ? 'is-active' : ''} onClick={() => setSettings({ ...settings, provider: 'groq', baseUrl: settings.provider === 'groq' ? settings.baseUrl : 'https://api.groq.com/openai/v1', model: settings.provider === 'groq' ? settings.model : 'llama-3.3-70b-versatile' })}>Groq</button>
+              <button type="button" className={settings.provider === 'openrouter' ? 'is-active' : ''} onClick={() => setSettings({ ...settings, provider: 'openrouter', baseUrl: settings.provider === 'openrouter' ? settings.baseUrl : 'https://openrouter.ai/api/v1', model: settings.provider === 'openrouter' ? settings.model : 'openai/gpt-4o-mini' })}>OpenRouter</button>
+              <button type="button" className={settings.provider === 'local' ? 'is-active' : ''} onClick={() => setSettings({ ...settings, provider: 'local', baseUrl: settings.provider === 'local' ? settings.baseUrl : 'http://localhost:11434/v1', model: settings.provider === 'local' ? settings.model : 'llama3.2:3b' })}>Local model</button>
+            </div>
+            {settings.provider !== 'local' && <label className="form-field"><span>API key</span><input type="password" autoComplete="new-password" placeholder={savedProvider === settings.provider ? 'Saved key retained when blank' : settings.provider === 'groq' ? 'gsk_...' : 'sk-or-...'} value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} /></label>}
             <label className="form-field"><span>Base URL</span><input required value={settings.baseUrl} onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })} placeholder="http://localhost:11434/v1" /></label>
             <label className="form-field"><span>Model name</span><input required value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} placeholder="llama3.2:3b" /></label>
             {settingsMessage && <div className={`settings-feedback ${settingsMessage.startsWith('Connection successful') || settingsMessage.startsWith('Settings saved') ? 'is-success' : ''}`} role="status">{settingsMessage.startsWith('Connection successful') || settingsMessage.startsWith('Settings saved') ? <Check size={15} /> : <CircleAlert size={15} />}{settingsMessage}</div>}
