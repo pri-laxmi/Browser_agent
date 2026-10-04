@@ -1,5 +1,5 @@
 export type ModelSettings = {
-  provider: 'openrouter' | 'local'
+  provider: 'openrouter' | 'groq' | 'local'
   baseUrl: string
   model: string
   apiKey?: string
@@ -99,8 +99,41 @@ function completionUrl(settings: ModelSettings) {
   return `${settings.baseUrl.replace(/\/+$/, '')}/chat/completions`
 }
 
+function waitForRetry(milliseconds: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error('Task stopped by user.'))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, milliseconds)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new Error('Task stopped by user.'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+function rateLimitRetryDelay(response: Response, detail: string) {
+  const retryAfter = response.headers.get('retry-after')
+  const retryAfterDate = retryAfter ? Date.parse(retryAfter) : Number.NaN
+  const headerSeconds = retryAfter && Number.isFinite(Number(retryAfter))
+    ? Number(retryAfter)
+    : Number.isFinite(retryAfterDate)
+      ? Math.max(0, (retryAfterDate - Date.now()) / 1000)
+      : 0
+  const messageSeconds = detail.match(/try again in\s+([\d.]+)\s*(?:s|sec|seconds?)\b/i)
+  const seconds = Math.max(headerSeconds, messageSeconds ? Number(messageSeconds[1]) : 0)
+  return Math.max(22_000, Math.ceil(seconds * 1000))
+}
+
 async function requestCompletion(settings: ModelSettings, messages: Array<Record<string, unknown>>, signal: AbortSignal) {
-  const response = await fetch(completionUrl(settings), {
+  const promptCharacters = messages.reduce((total, message) => total + (typeof message.content === 'string' ? message.content.length : 0), 0)
+  console.info(`[browser-pilot] Sending model request (${messages.length} messages, ${promptCharacters} prompt characters).`)
+  const sendRequest = () => fetch(completionUrl(settings), {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -117,6 +150,15 @@ async function requestCompletion(settings: ModelSettings, messages: Array<Record
     }),
     signal: AbortSignal.any([signal, AbortSignal.timeout(90_000)]),
   })
+  let response = await sendRequest()
+  if (response.status === 429) {
+    const limitedBody = await response.json().catch(() => null) as { error?: { message?: string } | string } | null
+    const detail = typeof limitedBody?.error === 'string' ? limitedBody.error : limitedBody?.error?.message
+    const delay = rateLimitRetryDelay(response, detail ?? '')
+    console.warn(`[browser-pilot] Model rate limited; retrying once in ${Math.ceil(delay / 1000)}s.`)
+    await waitForRetry(delay, signal)
+    response = await sendRequest()
+  }
   const body = await response.json().catch(() => null) as { error?: { message?: string } | string; choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ function?: { arguments?: string } }> } }> } | null
   if (!response.ok) {
     const detail = typeof body?.error === 'string' ? body.error : body?.error?.message
@@ -199,10 +241,13 @@ export async function runAgent(options: AgentOptions) {
     const messages: Array<Record<string, unknown>> = [
       {
         role: 'system',
-        content: 'You are Browser Pilot, an autonomous web browser agent. The user asks you to accomplish a task in the current browser. At each turn you receive a fresh text observation with the current URL, title, visible page text, and numbered visible elements. Choose exactly one browser_action tool call per step. Every action MUST include safety.level ("safe" or "critical") and a non-empty safety.reason based on what the action will do; assess conservatively. Runtime rules independently classify actions too. If approval is denied, do not repeat that action or attempt an equivalent workaround; choose another safe approach or explain the limitation. Before assuming login is needed, inspect the page for signs of an existing session such as account/profile menus, versus sign-in/log-in buttons or credential fields. Never ask for or enter passwords, passcodes, one-time codes, or other credentials. If a task requires sign-in, call ask_user with a clear request for the user to sign in in the browser window; wait for the user to continue, then inspect the page again. Use ask_user for necessary non-sensitive questions such as demographic preferences. Use element numbers from the latest observation for click and type_text. Navigate only to HTTP/HTTPS URLs. Never repeat a successful action; after successful navigation inspect the current observation and continue. Handle errors by adapting. Use extract_text to gather details, and finish with a concise factual summary once the task is done. Never claim an action succeeded unless its result says so. You have at most 40 steps.',
+        content: 'You are Browser Pilot, an autonomous web browser agent. The user asks you to accomplish a task in the current browser. At each turn you receive a fresh text observation with the current URL, title, visible page text, and numbered visible elements. Choose exactly one browser_action tool call per step. Every action MUST include safety.level ("safe" or "critical") and a non-empty safety.reason based on what the action will do; assess conservatively. Runtime rules independently classify actions too. If approval is denied, do not repeat that action or attempt an equivalent workaround; choose another safe approach or explain the limitation. Before assuming login is needed, inspect the page for signs of an existing session such as account/profile menus, versus sign-in/log-in buttons or credential fields. Never ask for or enter passwords, passcodes, one-time codes, or other credentials. If a task requires sign-in, call ask_user with a clear request for the user to sign in in the browser window; wait for the user to continue, then inspect the page again. Use ask_user for necessary non-sensitive questions such as demographic preferences. Use element numbers from the latest observation for click and type_text. If a click fails because another element blocks it, inspect the new observation and handle the visible blocker or choose another appropriate target; do not click hidden elements or repeat the same blocked click. Navigate only to HTTP/HTTPS URLs. Never repeat a successful action; after successful navigation inspect the current observation and continue. Handle errors by adapting. Use extract_text to gather details, and finish with a concise factual summary once the task is done. Never claim an action succeeded unless its result says so. You have at most 40 steps.',
       },
-      ...history.slice(-12),
-      { role: 'user', content: `Task: ${task}\n\nPrevious browser actions and results:\n${history.filter((entry) => entry.role === 'user').slice(-6).map((entry) => entry.content).join('\n') || 'None.'}\n\nCurrent observation:\n${observation}` },
+      ...history.slice(-6).map((entry) => ({
+        ...entry,
+        content: entry.content.length > 1800 ? `${entry.content.slice(0, 1800)}\n[Earlier result truncated]` : entry.content,
+      })),
+      { role: 'user', content: `Task: ${task}\n\nCurrent observation:\n${observation}` },
     ]
     let action: BrowserAction
     try {
@@ -237,12 +282,9 @@ export async function runAgent(options: AgentOptions) {
       }
       assessment = await assess(action, observation)
     }
-    if (action.action !== 'finish' && (action.safety.level === 'critical' || assessment.critical)) {
-      const reasons = [
-        action.safety.level === 'critical' ? action.safety.reason : '',
-        assessment.critical ? assessment.reason : '',
-      ].filter(Boolean)
-      const approved = await raceAbort(requestApproval(action, reasons.join(' Runtime safety rule: '), assessment.target), signal)
+    if (action.action !== 'finish' && assessment.critical) {
+      const reasons = [assessment.reason, action.safety.level === 'critical' ? action.safety.reason : ''].filter(Boolean)
+      const approved = await raceAbort(requestApproval(action, reasons.join(' Model assessment: '), assessment.target), signal)
       if (!approved) {
         const timestamp = Date.now()
         const result = 'Approval denied. The action was skipped; choose a different approach without repeating it.'
