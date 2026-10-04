@@ -42,8 +42,9 @@ Browser Pilot workspace
 - `server/src/index.ts` starts Express and a WebSocket server on the same HTTP server. Playwright launches the installed Chrome channel in headed mode, using the project-local persistent profile.
 - The server follows newly opened tabs and streams the newest active page as JPEG frames about every 400 ms (roughly 2.5 frames per second), together with the current URL, title, and capture time. Frames are sent only while at least one WebSocket client is connected.
 - `web/src/BrowserPilot.tsx` renders the app shell and live frame. It reconnects to the WebSocket with increasing delays when the connection drops and shows connecting, connected, disconnected, and error states.
-- `server/src/agent.ts` uses plain `fetch` chat-completion requests with one browser-action tool per turn. It builds text-only page observations, retries malformed actions once, and limits runs to 40 steps.
-- Express exposes `/api/settings` and `/api/settings/test` for model setup, `/api/tasks` and `/api/tasks/:id` for running and persisted task history, and `/api/tasks/:id/stop` to halt a run. User questions can be answered at `/api/tasks/:id/respond`.
+- `server/src/agent.ts` uses plain `fetch` chat-completion requests with one browser-action tool per turn. Each action requires a model-provided safe/critical classification and reason; runtime keyword checks independently inspect the target and observed page text. Critical actions wait for explicit approval in the app and are never auto-approved.
+- The agent checks for existing account/session indicators before requesting sign-in, never handles credentials, and pauses for the user to sign in directly in Chrome. Non-sensitive questions use the same interaction card with a reply field. All pending interactions can be stopped.
+- Express exposes `/api/settings` and `/api/settings/test` for model setup, `/api/tasks` and `/api/tasks/:id` for running and persisted task history, and `/api/tasks/:id/stop` to halt a run. User questions and sign-in continuation use `/api/tasks/:id/respond`; safety decisions use `/api/tasks/:id/approve`.
 - Vite proxies `/api` to the server during development; live browser frames and task events use the existing WebSocket.
 
 ## WebSocket Messages
@@ -71,6 +72,7 @@ Only HTTP and HTTPS navigation URLs are accepted. The page title and URL appear 
 - `GET /health` reports browser startup state.
 - `GET /api/settings` returns the configured provider and model without revealing the saved API key. `PUT /api/settings` saves settings; `POST /api/settings/test` makes a small completion request and returns a readable result.
 - `POST /api/tasks` accepts `{ "task": "..." }` and returns a task ID. Progress and completion are streamed as `agent-event` and `task-finished` WebSocket messages.
-- `GET /api/tasks` lists recent task summaries. `GET /api/tasks/:id` returns a task's events and action results. `POST /api/tasks/:id/stop` stops a run.
+- `GET /api/tasks` lists recent task summaries. `GET /api/tasks/:id` returns a task's events and action results. `POST /api/tasks/:id/stop` stops a run, including while awaiting user input or approval.
+- `POST /api/tasks/:id/respond` accepts `{ "answer": "..." }` for a non-sensitive question or `{ "answer": "Continue" }` after the user signs in directly in Chrome. `POST /api/tasks/:id/approve` accepts `{ "approved": true }` or `{ "approved": false }`; denial skips the action and informs the model.
 
 The browser-control WebSocket currently has no authentication, so keep the server on a trusted development machine and do not expose port `3001` to an untrusted network.

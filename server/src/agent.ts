@@ -7,6 +7,7 @@ export type ModelSettings = {
 
 export type BrowserAction = {
   action: 'go_to_url' | 'click' | 'type_text' | 'press_key' | 'scroll' | 'wait' | 'extract_text' | 'ask_user' | 'finish'
+  safety: { level: 'safe' | 'critical'; reason: string }
   url?: string
   element?: number
   text?: string
@@ -21,7 +22,8 @@ export type BrowserAction = {
 export type AgentEvent = {
   type: 'step' | 'summary'
   description: string
-  status: 'thinking' | 'running' | 'done' | 'failed'
+  status: 'thinking' | 'running' | 'waiting' | 'done' | 'denied' | 'failed'
+  interaction?: 'approval' | 'login' | 'question'
   timestamp: number
   step?: number
 }
@@ -39,6 +41,8 @@ type AgentOptions = {
   signal: AbortSignal
   observe: () => Promise<string>
   execute: (action: BrowserAction) => Promise<string>
+  assess: (action: BrowserAction, observation: string) => Promise<{ critical: boolean; reason: string; target: string; requiresLogin: boolean; loggedIn: boolean }>
+  requestApproval: (action: BrowserAction, reason: string, target: string) => Promise<boolean>
   emit: (event: AgentEvent) => void
   saveStep: (step: AgentStep) => void
 }
@@ -66,6 +70,15 @@ const actionSchema = {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['go_to_url', 'click', 'type_text', 'press_key', 'scroll', 'wait', 'extract_text', 'ask_user', 'finish'] },
+        safety: {
+          type: 'object',
+          properties: {
+            level: { type: 'string', enum: ['safe', 'critical'] },
+            reason: { type: 'string', description: 'Why this action is safe or critical.' },
+          },
+          required: ['level', 'reason'],
+          additionalProperties: false,
+        },
         url: { type: 'string', description: 'HTTP or HTTPS URL to open.' },
         element: { type: 'integer', description: 'Number of a visible element in the observation.' },
         text: { type: 'string', description: 'Text to type, extraction instruction, or question for the user.' },
@@ -76,7 +89,7 @@ const actionSchema = {
         seconds: { type: 'number', description: 'Wait duration, at most 10 seconds.' },
         summary: { type: 'string', description: 'Short final result for the user.' },
       },
-      required: ['action'],
+      required: ['action', 'safety'],
       additionalProperties: false,
     },
   },
@@ -140,6 +153,9 @@ function validateAction(value: unknown): BrowserAction | null {
     : source
   const names: BrowserAction['action'][] = ['go_to_url', 'click', 'type_text', 'press_key', 'scroll', 'wait', 'extract_text', 'ask_user', 'finish']
   if (!names.includes(action.action as BrowserAction['action'])) return null
+  if (!action.safety || typeof action.safety !== 'object') return null
+  const safety = action.safety as Record<string, unknown>
+  if (!['safe', 'critical'].includes(String(safety.level)) || typeof safety.reason !== 'string' || !safety.reason.trim()) return null
   if (typeof action.element === 'string' && /^\d+$/.test(action.element)) action.element = Number(action.element)
   if (action.action === 'go_to_url' && typeof action.url !== 'string') return null
   if (['click', 'type_text'].includes(String(action.action)) && !Number.isInteger(action.element)) return null
@@ -148,27 +164,6 @@ function validateAction(value: unknown): BrowserAction | null {
   if (action.action === 'ask_user' && typeof action.text !== 'string') return null
   if (action.action === 'finish' && typeof action.summary !== 'string') return null
   return action as unknown as BrowserAction
-}
-
-function actionFromText(content: string | null | undefined): BrowserAction | null {
-  if (!content) return null
-  const candidate = content.match(/\{[\s\S]*\}/)?.[0]
-  if (candidate) {
-    try {
-      const parsed = validateAction(JSON.parse(candidate))
-      if (parsed) return parsed
-    } catch {
-      // Fall through to the conservative plain-text patterns below.
-    }
-  }
-  const text = content.trim()
-  const navigate = text.match(/(?:go to|open|navigate to)\s+(https?:\/\/\S+)/i)
-  if (navigate) return { action: 'go_to_url', url: navigate[1].replace(/[),.]+$/, '') }
-  const click = text.match(/\bclick\s+(?:element\s+)?#?(\d+)\b/i)
-  if (click) return { action: 'click', element: Number(click[1]) }
-  const finish = text.match(/\b(?:finish|summary)\s*:\s*([\s\S]+)/i)
-  if (finish) return { action: 'finish', summary: finish[1].trim().slice(0, 1000) }
-  return null
 }
 
 async function nextAction(settings: ModelSettings, messages: Array<Record<string, unknown>>, signal: AbortSignal) {
@@ -188,14 +183,12 @@ async function nextAction(settings: ModelSettings, messages: Array<Record<string
     }
     if (attempt === 0) reminder = 'Your previous response did not contain one valid browser_action tool call. Retry now with exactly one valid tool call and the required fields.'
   }
-  const fallback = actionFromText(finalText)
-  if (fallback) return fallback
   const excerpt = finalText?.trim().slice(0, 240)
-  throw new Error(`The model did not return a valid browser action after one retry.${excerpt ? ` Response: ${excerpt}` : ' The response was empty; check that the model supports tool calling.'}`)
+  throw new Error(`The model did not return a valid browser action with a safety assessment after one retry.${excerpt ? ` Response: ${excerpt}` : ' The response was empty; check that the model supports tool calling.'}`)
 }
 
 export async function runAgent(options: AgentOptions) {
-  const { task, settings, signal, observe, execute, emit, saveStep } = options
+  const { task, settings, signal, observe, execute, assess, requestApproval, emit, saveStep } = options
   const history: Array<{ role: string; content: string }> = []
   emit({ type: 'step', description: 'Understanding the task and inspecting the page', status: 'thinking', timestamp: Date.now(), step: 0 })
 
@@ -206,7 +199,7 @@ export async function runAgent(options: AgentOptions) {
     const messages: Array<Record<string, unknown>> = [
       {
         role: 'system',
-        content: 'You are Browser Pilot, an autonomous web browser agent. The user asks you to accomplish a task in the current browser. At each turn you receive a fresh text observation with the current URL, title, visible page text, and numbered visible elements. Choose exactly one browser_action tool call per step. Use element numbers from the latest observation for click and type_text. Navigate only to HTTP/HTTPS URLs. Never repeat a successful action; after successful navigation inspect the current observation and continue. Handle errors by adapting. Use extract_text to gather details, ask_user only when essential, and finish with a concise factual summary once the task is done. Never claim an action succeeded unless its result says so. You have at most 40 steps.',
+        content: 'You are Browser Pilot, an autonomous web browser agent. The user asks you to accomplish a task in the current browser. At each turn you receive a fresh text observation with the current URL, title, visible page text, and numbered visible elements. Choose exactly one browser_action tool call per step. Every action MUST include safety.level ("safe" or "critical") and a non-empty safety.reason based on what the action will do; assess conservatively. Runtime rules independently classify actions too. If approval is denied, do not repeat that action or attempt an equivalent workaround; choose another safe approach or explain the limitation. Before assuming login is needed, inspect the page for signs of an existing session such as account/profile menus, versus sign-in/log-in buttons or credential fields. Never ask for or enter passwords, passcodes, one-time codes, or other credentials. If a task requires sign-in, call ask_user with a clear request for the user to sign in in the browser window; wait for the user to continue, then inspect the page again. Use ask_user for necessary non-sensitive questions such as demographic preferences. Use element numbers from the latest observation for click and type_text. Navigate only to HTTP/HTTPS URLs. Never repeat a successful action; after successful navigation inspect the current observation and continue. Handle errors by adapting. Use extract_text to gather details, and finish with a concise factual summary once the task is done. Never claim an action succeeded unless its result says so. You have at most 40 steps.',
       },
       ...history.slice(-12),
       { role: 'user', content: `Task: ${task}\n\nPrevious browser actions and results:\n${history.filter((entry) => entry.role === 'user').slice(-6).map((entry) => entry.content).join('\n') || 'None.'}\n\nCurrent observation:\n${observation}` },
@@ -220,6 +213,44 @@ export async function runAgent(options: AgentOptions) {
       throw error
     }
     if (signal.aborted) throw new Error('Task stopped by user.')
+    let assessment = await assess(action, observation)
+    if (action.action === 'ask_user' && /\b(sign in|log in)\b/i.test(action.text ?? '') && assessment.loggedIn) {
+      const result = 'The page already shows an active account menu. Do not ask the user to sign in; continue with the task.'
+      const timestamp = Date.now()
+      emit({ type: 'step', description: 'The page already appears signed in, so the sign-in request was skipped.', status: 'done', timestamp, step: number })
+      saveStep({ number, action, result, timestamp })
+      history.push({ role: 'assistant', content: JSON.stringify(action) }, { role: 'user', content: `Action result: ${result}` })
+      continue
+    }
+    if (['click', 'type_text', 'press_key'].includes(action.action) && assessment.requiresLogin) {
+      action = {
+        action: 'ask_user',
+        text: 'Please sign in to the website in the browser window, then click Continue here.',
+        safety: { level: 'safe', reason: 'The user will complete sign-in directly in the browser; Browser Pilot will not handle credentials.' },
+      }
+      assessment = await assess(action, observation)
+    } else if (action.action === 'ask_user' && /\b(password|passcode|one[- ]time code|verification code|login code|credentials?|security code|pin)\b/i.test(action.text ?? '')) {
+      action = {
+        action: 'ask_user',
+        text: 'Please sign in to the website in the browser window, then click Continue here.',
+        safety: { level: 'safe', reason: 'The user will complete sign-in directly in the browser; Browser Pilot will not handle credentials.' },
+      }
+      assessment = await assess(action, observation)
+    }
+    if (action.action !== 'finish' && (action.safety.level === 'critical' || assessment.critical)) {
+      const reasons = [
+        action.safety.level === 'critical' ? action.safety.reason : '',
+        assessment.critical ? assessment.reason : '',
+      ].filter(Boolean)
+      const approved = await raceAbort(requestApproval(action, reasons.join(' Runtime safety rule: '), assessment.target), signal)
+      if (!approved) {
+        const timestamp = Date.now()
+        const result = 'Approval denied. The action was skipped; choose a different approach without repeating it.'
+        saveStep({ number, action, result, timestamp })
+        history.push({ role: 'assistant', content: JSON.stringify(action) }, { role: 'user', content: `Action result: ${result}` })
+        continue
+      }
+    }
     if (action.action === 'finish') {
       const summary = action.summary || 'Task finished.'
       emit({ type: 'summary', description: summary, status: 'done', timestamp: Date.now(), step: number })

@@ -22,7 +22,22 @@ let captureInProgress = false
 
 type TaskRecord = { id: string; task: string; status: 'running' | 'completed' | 'failed' | 'stopped'; summary?: string; events: AgentEvent[]; steps: AgentStep[]; createdAt: number; updatedAt: number }
 let taskHistory: TaskRecord[] = []
-let activeTask: { id: string; controller: AbortController; answerQuestion?: (answer: string) => void } | null = null
+let activeTask: {
+  id: string
+  controller: AbortController
+  answerQuestion?: (answer: string) => void
+  answerApproval?: (approved: boolean) => void
+} | null = null
+
+const safetyKeywords = ['pay', 'payment', 'buy now', 'place order', 'checkout', 'purchase', 'subscribe', 'confirm payment', 'delete', 'remove account', 'text', 'post', 'change password', 'card number']
+
+function matchingSafetyKeyword(value: string) {
+  const normalized = value.replace(/\s+/g, ' ').toLowerCase()
+  return safetyKeywords.find((keyword) => {
+    const expression = new RegExp(`\\b${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replaceAll(' ', '\\s+')}\\b`, 'i')
+    return expression.test(normalized)
+  })
+}
 
 async function loadJson<T>(path: string, fallback: T): Promise<T> {
   try {
@@ -184,10 +199,145 @@ app.post('/api/tasks', async (request, response) => {
           element.setAttribute('data-browser-pilot-id', id)
           const control = element
           const label = control.labels?.[0]?.innerText?.trim() || element.getAttribute('aria-label') || element.getAttribute('title') || (element.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100)
-          return id + '. <' + element.tagName.toLowerCase() + '> role=' + (element.getAttribute('role') || '') + ' label=' + JSON.stringify(label) + ' placeholder=' + JSON.stringify(control.placeholder || '')
+          const details = [control.type, control.name, control.autocomplete].filter(Boolean).join(' ')
+          return id + '. <' + element.tagName.toLowerCase() + '> role=' + (element.getAttribute('role') || '') + ' label=' + JSON.stringify(label) + ' placeholder=' + JSON.stringify(control.placeholder || '') + ' details=' + JSON.stringify(details)
         })
         return 'URL: ' + location.href + '\nTitle: ' + document.title + '\nVisible text:\n' + (document.body.innerText || '').slice(0, 7000) + '\nVisible interactive elements:\n' + items.join('\n')
       })()`)
+    },
+    assess: async (action: BrowserAction, observation: string) => {
+      const page = activePage
+      if (!page || page.isClosed()) throw new Error('The active browser page is unavailable.')
+      let target = action.action.replaceAll('_', ' ')
+      let requiresLogin = false
+      const loggedIn = Boolean(await page.evaluate(String.raw`(() => {
+        const visible = (element) => {
+          const rect = element.getBoundingClientRect()
+          const style = getComputedStyle(element)
+          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) > 0
+        }
+        const controls = [...document.querySelectorAll('button,a,[role="button"],[aria-haspopup]')].filter(visible)
+        const labels = controls.map((element) => [
+          element.textContent,
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+        ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim())
+        const hasSignOut = labels.some((label) => /\b(sign out|log out)\b/i.test(label))
+        const hasAccountMenu = labels.some((label) => /\b(account menu|profile menu|your account|my account|account & lists|hello,\s*\w+)\b/i.test(label))
+        const hasSignIn = labels.some((label) => /\b(sign in|log in|sign up|create account)\b/i.test(label))
+        return hasSignOut || (hasAccountMenu && !hasSignIn)
+      })()`))
+      if (action.action === 'click' || action.action === 'type_text') {
+        const details = await page.evaluate((elementId) => {
+          const element = document.querySelector(`[data-browser-pilot-id="${elementId}"]`)
+          if (!element) return null
+          const input = element as HTMLInputElement
+          const form = element.closest('form')
+          const credentialForm = Boolean(form?.querySelector('input[type="password"],input[autocomplete="current-password"]'))
+          const label = input.labels?.[0]?.innerText?.trim()
+          const fieldDetails = `${input.name} ${input.placeholder} ${input.id} ${input.autocomplete} ${label}`
+          const usernameField = ['username', 'current-password'].includes(input.autocomplete) || /user(name)?|login/i.test(fieldDetails)
+          const credentialField = input.matches('input') && (
+            input.type === 'password' ||
+            usernameField ||
+            (credentialForm && input.autocomplete === 'email') ||
+            /pass(word|code)?|one[-_ ]time|verification[-_ ]code|security[-_ ]code|\botp\b|\bpin\b/i.test(fieldDetails)
+          )
+          const loginForm = credentialForm || (usernameField && Boolean(document.querySelector('input[type="password"],input[autocomplete="current-password"]')))
+          const context = element.closest('label,form,[role="group"],li')?.textContent?.trim()
+          const descriptor = [
+            element.tagName.toLowerCase(),
+            element.getAttribute('type'),
+            element.getAttribute('name'),
+            element.getAttribute('autocomplete'),
+            label,
+            element.getAttribute('aria-label'),
+            element.getAttribute('placeholder'),
+            element.getAttribute('title'),
+            element.textContent?.trim(),
+            context,
+          ].filter(Boolean).join(' ').replace(/\s+/g, ' ').slice(0, 500)
+          return { descriptor, credentialField, loginForm }
+        }, action.element)
+        if (details) {
+          target = details.descriptor
+          requiresLogin = (action.action === 'type_text' && details.credentialField) ||
+            (action.action === 'click' && (details.loginForm || (!loggedIn && /\b(sign in|log in)\b/i.test(details.descriptor))))
+        }
+      } else if (action.action === 'press_key') {
+        requiresLogin = await page.evaluate(String.raw`(() => {
+          const element = document.activeElement
+          if (!element) return false
+          const input = element
+          const formHasPassword = Boolean(element.closest('form')?.querySelector('input[type="password"],input[autocomplete="current-password"]'))
+          const fieldDetails = [
+            input.name,
+            input.placeholder,
+            input.id,
+            input.autocomplete,
+            input.labels?.[0]?.innerText,
+          ].filter(Boolean).join(' ')
+          return formHasPassword || /password|passcode|one[-_ ]time|verification[-_ ]code|security[-_ ]code|\botp\b|\bpin\b/i.test(fieldDetails)
+        })()`)
+        if (requiresLogin) target = 'the focused login or verification field'
+      } else if (action.action === 'go_to_url') {
+        target = action.url ?? 'the requested website'
+      }
+      if (action.action === 'ask_user' || action.action === 'finish') {
+        return { critical: false, reason: '', target, requiresLogin, loggedIn }
+      }
+      const pageContent = await page.locator('body').innerText({ timeout: 8_000 })
+      const keywordInTarget = matchingSafetyKeyword(target)
+      const keywordInPage = matchingSafetyKeyword(pageContent || observation)
+      const sensitiveCardField = /(?:cc[-_]?number|card[\s_-]*number)/i.test(target)
+      const matchedKeyword = keywordInTarget ?? keywordInPage
+      const critical = Boolean(matchedKeyword || sensitiveCardField)
+      const reason = sensitiveCardField
+        ? 'The target is a payment-card number field.'
+        : matchedKeyword
+          ? `The runtime safety rule matched "${matchedKeyword}" in the ${keywordInTarget ? 'target element' : 'page content'}.`
+          : ''
+      return { critical, reason, target, requiresLogin, loggedIn }
+    },
+    requestApproval: async (action: BrowserAction, reason: string, target: string) => {
+      const current = activeTask
+      if (!current || current.id !== record.id) throw new Error('Task is no longer active.')
+      const targetLabel = target ? `“${target.slice(0, 160)}”` : 'the page'
+      let actionDescription: string
+      if (action.action === 'click') actionDescription = `click ${targetLabel}`
+      else if (action.action === 'type_text' && /cc[-_]?number|card[\s_-]*number/i.test(target)) actionDescription = `enter payment-card details in ${targetLabel}`
+      else if (action.action === 'type_text') actionDescription = `enter “${(action.text ?? '').slice(0, 160)}” in ${targetLabel}`
+      else if (action.action === 'go_to_url') actionDescription = `open ${action.url}`
+      else if (action.action === 'press_key') actionDescription = `press ${action.key} on the page`
+      else if (action.action === 'extract_text') actionDescription = 'read the visible text on the page'
+      else actionDescription = `${action.action.replaceAll('_', ' ')} on ${targetLabel}`
+      const interaction: AgentEvent['interaction'] = 'approval'
+      emitTaskEvent(record, {
+        type: 'step',
+        description: `The agent is about to ${actionDescription}. ${reason}`,
+        status: 'waiting',
+        interaction,
+        timestamp: Date.now(),
+      })
+      return new Promise<boolean>((resolve, reject) => {
+        const onAbort = () => {
+          current.answerApproval = undefined
+          reject(new Error('Task stopped by user.'))
+        }
+        current.answerApproval = (approved) => {
+          controller.signal.removeEventListener('abort', onAbort)
+          current.answerApproval = undefined
+          emitTaskEvent(record, {
+            type: 'step',
+            description: approved ? 'Approval granted.' : 'Approval denied; the action was skipped.',
+            status: approved ? 'done' : 'denied',
+            interaction,
+            timestamp: Date.now(),
+          })
+          resolve(approved)
+        }
+        controller.signal.addEventListener('abort', onAbort, { once: true })
+      })
     },
     execute: async (action: BrowserAction) => {
       const page = activePage
@@ -226,7 +376,9 @@ app.post('/api/tasks', async (request, response) => {
         return `Extracted page text: ${extracted.slice(0, 12_000)}`
       }
       if (action.action === 'ask_user') {
-        emitTaskEvent(record, { type: 'step', description: `Question for user: ${action.text}`, status: 'running', timestamp: Date.now() })
+        const isLogin = /\b(sign in|log in)\b/i.test(action.text ?? '')
+        const interaction: AgentEvent['interaction'] = isLogin ? 'login' : 'question'
+        emitTaskEvent(record, { type: 'step', description: action.text!, status: 'waiting', interaction, timestamp: Date.now() })
         return new Promise<string>((resolve, reject) => {
           const current = activeTask
           if (!current || current.id !== record.id) {
@@ -240,6 +392,13 @@ app.post('/api/tasks', async (request, response) => {
           current.answerQuestion = (answer) => {
             controller.signal.removeEventListener('abort', onAbort)
             current.answerQuestion = undefined
+            emitTaskEvent(record, {
+              type: 'step',
+              description: isLogin ? 'The user continued after signing in. Inspecting the page again.' : 'The user replied to the question.',
+              status: 'done',
+              interaction,
+              timestamp: Date.now(),
+            })
             resolve(`User replied: ${answer}`)
           }
           controller.signal.addEventListener('abort', onAbort, { once: true })
@@ -288,6 +447,20 @@ app.post('/api/tasks/:id/respond', (request, response) => {
     return
   }
   activeTask.answerQuestion(answer.slice(0, 2000))
+  response.json({ accepted: true })
+})
+
+app.post('/api/tasks/:id/approve', (request, response) => {
+  const approved = request.body?.approved
+  if (typeof approved !== 'boolean') {
+    response.status(400).json({ error: 'Choose approve or deny.' })
+    return
+  }
+  if (activeTask?.id !== request.params.id || !activeTask.answerApproval) {
+    response.status(409).json({ error: 'This task is not waiting for an approval.' })
+    return
+  }
+  activeTask.answerApproval(approved)
   response.json({ accepted: true })
 })
 

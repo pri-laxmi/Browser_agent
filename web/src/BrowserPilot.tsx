@@ -13,6 +13,7 @@ import {
   Moon,
   Plus,
   Settings2,
+  ShieldAlert,
   Sparkles,
   Sun,
   Waypoints,
@@ -22,7 +23,7 @@ import './pilot.css'
 
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
 type BrowserSnapshot = { url: string; title: string; image: string; capturedAt: number }
-type AgentEvent = { type: 'step' | 'summary'; description: string; status: 'thinking' | 'running' | 'done' | 'failed'; timestamp: number; step?: number }
+type AgentEvent = { type: 'step' | 'summary'; description: string; status: 'thinking' | 'running' | 'waiting' | 'done' | 'denied' | 'failed'; interaction?: 'approval' | 'login' | 'question'; timestamp: number; step?: number }
 type HistoryEntry = { id: string; task: string; status: 'running' | 'completed' | 'failed' | 'stopped'; summary?: string; createdAt: number; updatedAt: number }
 type ModelSettings = { provider: 'openrouter' | 'local'; baseUrl: string; model: string; apiKey: string }
 
@@ -42,8 +43,9 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 function eventIcon(event: AgentEvent) {
   if (event.status === 'thinking') return <LoaderCircle className="event-spin" size={15} />
+  if (event.status === 'waiting') return <ShieldAlert size={15} />
   if (event.status === 'running') return <Bot size={15} />
-  if (event.status === 'failed') return <CircleAlert size={15} />
+  if (event.status === 'failed' || event.status === 'denied') return <CircleAlert size={15} />
   return <CircleCheck size={15} />
 }
 
@@ -61,10 +63,11 @@ function App() {
   const [history, setHistory] = useState<HistoryEntry[]>([])
   const [selectedTask, setSelectedTask] = useState<string | null>(null)
   const [events, setEvents] = useState<AgentEvent[]>([])
-  const [taskStatus, setTaskStatus] = useState<'ready' | 'thinking' | 'running' | 'completed' | 'failed' | 'stopped'>('ready')
+  const [taskStatus, setTaskStatus] = useState<'ready' | 'thinking' | 'running' | 'waiting' | 'completed' | 'failed' | 'stopped'>('ready')
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
-  const [pendingQuestion, setPendingQuestion] = useState('')
+  const [pendingInteraction, setPendingInteraction] = useState<AgentEvent | null>(null)
   const [userResponse, setUserResponse] = useState('')
+  const [interactionBusy, setInteractionBusy] = useState(false)
   const timelineRef = useRef<HTMLDivElement>(null)
   const activeTaskRef = useRef<string | null>(null)
   const selectedTaskRef = useRef<string | null>(null)
@@ -113,8 +116,22 @@ function App() {
               setEvents((current) => [...current, nextEvent])
             }
             if (taskId === activeTaskRef.current) {
-              setTaskStatus(nextEvent.type === 'summary' && nextEvent.status === 'done' ? 'completed' : nextEvent.status === 'done' ? 'running' : nextEvent.status)
-              if (nextEvent.description.startsWith('Question for user:')) setPendingQuestion(nextEvent.description.slice('Question for user:'.length).trim())
+              setTaskStatus(nextEvent.type === 'summary' && nextEvent.status === 'done'
+                ? 'completed'
+                : nextEvent.status === 'waiting'
+                  ? 'waiting'
+                  : nextEvent.status === 'done' || nextEvent.status === 'denied'
+                    ? 'running'
+                    : nextEvent.status)
+              if (nextEvent.status === 'waiting' && nextEvent.interaction) {
+                setPendingInteraction(nextEvent)
+                setUserResponse('')
+                setInteractionBusy(false)
+              } else if (nextEvent.interaction) {
+                setPendingInteraction((current) => current?.interaction === nextEvent.interaction ? null : current)
+                setUserResponse('')
+                setInteractionBusy(false)
+              }
             }
           }
           if (message.type === 'task-finished') {
@@ -123,6 +140,8 @@ function App() {
             if (taskId === activeTaskRef.current) {
               setTaskStatus(finalStatus)
               setActiveTaskId(null)
+              setPendingInteraction(null)
+              setInteractionBusy(false)
             }
             void api<HistoryEntry[]>('/tasks').then(setHistory).catch(() => undefined)
           }
@@ -153,7 +172,10 @@ function App() {
       setEvents(record.events)
       setTaskStatus(record.status)
       setActiveTaskId(record.status === 'running' ? id : null)
-      setPendingQuestion(record.events.findLast((item) => item.description.startsWith('Question for user:'))?.description.slice('Question for user:'.length).trim() ?? '')
+      setPendingInteraction(record.status === 'running'
+        ? record.events.findLast((item) => item.status === 'waiting' && item.interaction)
+          ?? null
+        : null)
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Could not load task history.')
     }
@@ -168,7 +190,8 @@ function App() {
     try {
       const result = await api<{ id: string }>('/tasks', { method: 'POST', body: JSON.stringify({ task: command.trim() }) })
       setEvents([])
-      setPendingQuestion('')
+      setPendingInteraction(null)
+      setInteractionBusy(false)
       setSelectedTask(result.id)
       setActiveTaskId(result.id)
       setTaskStatus('thinking')
@@ -185,14 +208,32 @@ function App() {
     try { await api(`/tasks/${activeTaskId}/stop`, { method: 'POST' }) } catch (error) { setStatusMessage(error instanceof Error ? error.message : 'Could not stop task.') }
   }
 
+  const sendInteractionResponse = async (answer: string) => {
+    if (!activeTaskId || !answer) return
+    setInteractionBusy(true)
+    try {
+      await api(`/tasks/${activeTaskId}/respond`, { method: 'POST', body: JSON.stringify({ answer }) })
+      setUserResponse('')
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Could not send your response.')
+      setInteractionBusy(false)
+    }
+  }
+
   const answerQuestion = async (event: FormEvent) => {
     event.preventDefault()
-    if (!activeTaskId || !userResponse.trim()) return
+    await sendInteractionResponse(pendingInteraction?.interaction === 'login' ? 'Continue' : userResponse.trim())
+  }
+
+  const approveAction = async (approved: boolean) => {
+    if (!activeTaskId || pendingInteraction?.interaction !== 'approval') return
+    setInteractionBusy(true)
     try {
-      await api(`/tasks/${activeTaskId}/respond`, { method: 'POST', body: JSON.stringify({ answer: userResponse }) })
-      setPendingQuestion('')
-      setUserResponse('')
-    } catch (error) { setStatusMessage(error instanceof Error ? error.message : 'Could not send your response.') }
+      await api(`/tasks/${activeTaskId}/approve`, { method: 'POST', body: JSON.stringify({ approved }) })
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Could not submit your approval.')
+      setInteractionBusy(false)
+    }
   }
 
   const saveSettings = async (event: FormEvent) => {
@@ -221,7 +262,13 @@ function App() {
   }
 
   const statusLabel = { connecting: 'Starting up', connected: 'Connected', disconnected: 'Reconnecting', error: 'Needs attention' }[status]
-  const taskLabel = { ready: 'READY FOR A TASK', thinking: 'THINKING', running: 'RUNNING', completed: 'COMPLETED', failed: 'FAILED', stopped: 'STOPPED' }[taskStatus]
+  const taskLabel = pendingInteraction?.interaction === 'approval'
+    ? 'WAITING FOR APPROVAL'
+    : pendingInteraction?.interaction === 'login'
+      ? 'WAITING FOR YOU TO LOG IN'
+      : pendingInteraction?.interaction === 'question'
+        ? 'WAITING FOR YOUR ANSWER'
+        : { ready: 'READY FOR A TASK', thinking: 'THINKING', running: 'RUNNING', waiting: 'WAITING', completed: 'COMPLETED', failed: 'FAILED', stopped: 'STOPPED' }[taskStatus]
   const selectedHistory = history.find((item) => item.id === selectedTask)
 
   return (
@@ -280,14 +327,40 @@ function App() {
               <div className="activity-heading"><div className="activity-title"><span className="activity-icon"><Bot size={15} /></span><span>{selectedHistory?.task ?? 'Activity'}</span></div><span className={`activity-state state-${taskStatus}`}>{taskLabel}</span></div>
               <div className="timeline-list" ref={timelineRef}>
                 {events.length ? events.map((item, index) => <div key={`${item.timestamp}-${index}`} className={`timeline-event event-${item.status} ${item.type === 'summary' ? 'event-summary' : ''}`}><div className="event-icon">{eventIcon(item)}</div><div className="timeline-copy"><span>{item.description}</span><small>{item.step ? `STEP ${item.step} · ` : ''}{new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></div></div>) : <div className="timeline-empty"><span className="timeline-stem" /><div className="timeline-node"><span /></div><div className="timeline-copy"><span>{selectedTask ? 'No activity recorded' : 'Waiting for your first task'}</span><small>Actions and progress will show up here.</small></div><span className="timeline-ready"><span /> STANDING BY</span></div>}
-                {pendingQuestion && activeTaskId && <form className="answer-form" onSubmit={(event) => void answerQuestion(event)}><label htmlFor="agent-answer">{pendingQuestion}</label><input id="agent-answer" value={userResponse} onChange={(event) => setUserResponse(event.target.value)} placeholder="Your response..." autoComplete="off" /><button type="submit" disabled={!userResponse.trim()}>Reply</button></form>}
               </div>
               <div className="activity-footer"><span><span className="footer-dot" /> Browser session is private</span><span>{selectedHistory ? new Date(selectedHistory.createdAt).toLocaleDateString() : 'Chrome profile stays on this device'}</span></div>
             </section>
           </div>
-          <div className="workspace-footnote"><span>BUILT FOR THE OPEN WEB</span><span>PHASE 02 <span className="footnote-divider">/</span> AUTONOMY</span></div>
+          <div className="workspace-footnote"><span>BUILT FOR THE OPEN WEB</span><span>PHASE 03 <span className="footnote-divider">/</span> SAFETY</span></div>
         </div>
       </main>
+
+      {pendingInteraction && activeTaskId && <div className="safety-backdrop">
+        <section className="safety-card" role="alertdialog" aria-modal="true" aria-labelledby="interaction-title" aria-describedby="interaction-description">
+          <div className="safety-icon"><ShieldAlert size={22} /></div>
+          <span className="safety-eyebrow">
+            {pendingInteraction.interaction === 'approval' ? 'ACTION NEEDS YOUR APPROVAL' : pendingInteraction.interaction === 'login' ? 'SIGN IN IN YOUR BROWSER' : 'A QUESTION FOR YOU'}
+          </span>
+          <h2 id="interaction-title">
+            {pendingInteraction.interaction === 'approval' ? 'Review this action' : pendingInteraction.interaction === 'login' ? 'Please sign in' : 'Your input is needed'}
+          </h2>
+          <p id="interaction-description">{pendingInteraction.description}</p>
+          {pendingInteraction.interaction === 'approval' && <div className="safety-actions">
+            <button className="secondary-button" type="button" disabled={interactionBusy} onClick={() => void approveAction(false)}>Deny</button>
+            <button className="primary-button" type="button" disabled={interactionBusy} onClick={() => void approveAction(true)}>{interactionBusy ? 'Sending...' : 'Approve'}</button>
+          </div>}
+          {pendingInteraction.interaction === 'login' && <div className="safety-actions">
+            <button className="secondary-button" type="button" disabled={interactionBusy} onClick={() => void stopTask()}>Stop task</button>
+            <button className="primary-button" type="button" disabled={interactionBusy} onClick={() => void sendInteractionResponse('Continue')}>{interactionBusy ? 'Continuing...' : 'Continue'}</button>
+          </div>}
+          {pendingInteraction.interaction === 'question' && <form className="safety-question-form" onSubmit={(event) => void answerQuestion(event)}>
+            <label className="sr-only" htmlFor="interaction-answer">Your answer</label>
+            <input id="interaction-answer" value={userResponse} onChange={(event) => setUserResponse(event.target.value)} placeholder="Type your reply..." autoComplete="off" />
+            <button className="primary-button" type="submit" disabled={interactionBusy || !userResponse.trim()}>{interactionBusy ? 'Sending...' : 'Reply'}</button>
+          </form>}
+          {pendingInteraction.interaction !== 'login' && <button className="safety-stop" type="button" disabled={interactionBusy} onClick={() => void stopTask()}>Stop task instead</button>}
+        </section>
+      </div>}
 
       {settingsOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSettingsOpen(false) }}>
         <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
