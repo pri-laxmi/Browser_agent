@@ -10,22 +10,42 @@ const port = Number(process.env.PORT ?? 3001)
 const profilePath = resolve(process.cwd(), '.browser-profile')
 const settingsPath = resolve(process.cwd(), '.browser-pilot-settings.json')
 const historyPath = resolve(process.cwd(), '.browser-pilot-history.json')
+const maxTaskDurationMs = 10 * 60 * 1_000
 const app = express()
 const server = createServer(app)
 const webSocketServer = new WebSocketServer({ server })
 app.use(express.json({ limit: '32kb' }))
+app.use((request, response, next) => {
+  const startedAt = Date.now()
+  response.on('finish', () => {
+    logServerEvent('http-request', {
+      method: request.method,
+      path: request.path,
+      status: response.statusCode,
+      durationMs: Date.now() - startedAt,
+    })
+  })
+  next()
+})
 
 let browserContext: BrowserContext | null = null
 let activePage: Page | null = null
 let browserError: string | null = null
 let captureInProgress = false
+let browserLaunching = false
+let shuttingDown = false
+let browserRestartAttempts = 0
+let browserRestartTimer: NodeJS.Timeout | undefined
+let lastSnapshotErrorAt = 0
 const observedPages = new WeakSet<Page>()
+const liveWebSocketClients = new WeakSet<WebSocket>()
 
 type TaskRecord = { id: string; task: string; status: 'running' | 'completed' | 'failed' | 'stopped'; summary?: string; events: AgentEvent[]; steps: AgentStep[]; createdAt: number; updatedAt: number }
 let taskHistory: TaskRecord[] = []
 let activeTask: {
   id: string
   controller: AbortController
+  failureReason?: string
   answerQuestion?: (answer: string) => void
   answerApproval?: (approved: boolean) => void
 } | null = null
@@ -66,7 +86,11 @@ async function loadJson<T>(path: string, fallback: T): Promise<T> {
 }
 
 async function persistHistory() {
-  await writeFile(historyPath, JSON.stringify(taskHistory.slice(0, 50), null, 2), 'utf8')
+  try {
+    await writeFile(historyPath, JSON.stringify(taskHistory.slice(0, 50), null, 2), 'utf8')
+  } catch (error) {
+    logServerEvent('history-persist-failed', { error: error instanceof Error ? error.message : String(error) })
+  }
 }
 
 taskHistory = await loadJson<TaskRecord[]>(historyPath, [])
@@ -197,6 +221,12 @@ app.post('/api/tasks', async (request, response) => {
   const record: TaskRecord = { id: crypto.randomUUID(), task: taskText, status: 'running', events: [], steps: [], createdAt: Date.now(), updatedAt: Date.now() }
   taskHistory.unshift(record)
   const controller = new AbortController()
+  let taskTimedOut = false
+  const taskDeadline = setTimeout(() => {
+    taskTimedOut = true
+    logTaskEvent(record, 'task-timeout', { maxDurationMs: maxTaskDurationMs })
+    controller.abort()
+  }, maxTaskDurationMs)
   activeTask = { id: record.id, controller }
   logTaskEvent(record, 'task-started', { provider: settings.provider, model: settings.model })
   await persistHistory()
@@ -505,10 +535,12 @@ app.post('/api/tasks', async (request, response) => {
     record.status = controller.signal.aborted ? 'stopped' : 'completed'
     record.summary = summary
   }).catch((error) => {
-    record.status = controller.signal.aborted ? 'stopped' : 'failed'
-    record.summary = error instanceof Error ? error.message : String(error)
+    const failureReason = activeTask?.id === record.id ? activeTask.failureReason : undefined
+    record.status = failureReason || taskTimedOut || !controller.signal.aborted ? 'failed' : 'stopped'
+    record.summary = failureReason ?? (taskTimedOut ? 'Task timed out after 10 minutes.' : error instanceof Error ? error.message : String(error))
     emitTaskEvent(record, { type: 'step', description: record.summary, status: record.status === 'stopped' ? 'done' : 'failed', timestamp: Date.now() })
   }).finally(async () => {
+    clearTimeout(taskDeadline)
     record.updatedAt = Date.now()
     await persistHistory()
     if (activeTask?.id === record.id) activeTask = null
@@ -518,10 +550,12 @@ app.post('/api/tasks', async (request, response) => {
 })
 
 app.post('/api/tasks/:id/stop', (request, response) => {
-  if (activeTask?.id !== request.params.id) {
+  const task = taskHistory.find((item) => item.id === request.params.id)
+  if (activeTask?.id !== request.params.id || !task) {
     response.status(404).json({ error: 'No running task found.' })
     return
   }
+  logTaskEvent(task, 'task-stop-requested')
   activeTask.controller.abort()
   response.json({ stopped: true })
 })
@@ -561,9 +595,44 @@ app.get('/health', (_request, response) => {
 function sendToClients(payload: Record<string, unknown>) {
   const message = JSON.stringify(payload)
   for (const client of webSocketServer.clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(message)
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message, (error) => {
+        if (error) logServerEvent('websocket-send-failed', { error: error.message })
+      })
+    }
   }
 }
+
+function scheduleBrowserRestart() {
+  if (shuttingDown || browserRestartTimer) return
+  browserRestartAttempts += 1
+  const delayMs = Math.min(1_000 * 2 ** Math.min(browserRestartAttempts - 1, 5), 30_000)
+  logServerEvent('browser-restart-scheduled', { attempt: browserRestartAttempts, delayMs })
+  browserRestartTimer = setTimeout(() => {
+    browserRestartTimer = undefined
+    void launchBrowser()
+  }, delayMs)
+}
+
+webSocketServer.on('connection', (client) => {
+  liveWebSocketClients.add(client)
+  client.on('pong', () => liveWebSocketClients.add(client))
+  client.on('error', (error) => logServerEvent('websocket-client-error', { error: error.message }))
+  client.on('close', (code) => logServerEvent('websocket-client-closed', { code }))
+})
+
+const websocketHeartbeat = setInterval(() => {
+  for (const client of webSocketServer.clients) {
+    if (!liveWebSocketClients.has(client)) {
+      client.terminate()
+      continue
+    }
+    liveWebSocketClients.delete(client)
+    client.ping(undefined, undefined, (error: Error | undefined) => {
+      if (error) client.terminate()
+    })
+  }
+}, 30_000)
 
 function followPage(page: Page) {
   if (observedPages.has(page)) return
@@ -598,6 +667,16 @@ function followPage(page: Page) {
     if (activePage !== page) return
     const remainingPages = browserContext?.pages() ?? []
     activePage = remainingPages.at(-1) ?? null
+    if (!activePage && browserContext) {
+      const context = browserContext
+      void context.newPage().then((replacement) => {
+        if (browserContext !== context || replacement.isClosed()) return
+        followPage(replacement)
+        logServerEvent('browser-page-recreated')
+      }).catch((error: unknown) => {
+        logServerEvent('browser-page-recreate-failed', { error: error instanceof Error ? error.message : String(error) })
+      })
+    }
   })
 }
 
@@ -646,39 +725,66 @@ webSocketServer.on('connection', (client) => {
 })
 
 async function launchBrowser() {
+  if (browserLaunching || shuttingDown || browserContext) return
+  browserLaunching = true
+  let launchingContext: BrowserContext | null = null
   try {
-    browserContext = await chromium.launchPersistentContext(profilePath, {
+    const context = await chromium.launchPersistentContext(profilePath, {
       channel: 'chrome',
       headless: false,
       viewport: { width: 1440, height: 900 },
       ignoreDefaultArgs: ['--enable-automation'],
       args: ['--disable-blink-features=AutomationControlled'],
     })
-
-    await browserContext.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
+    launchingContext = context
+    browserContext = context
+    browserError = null
+    context.on('close', () => {
+      if (browserContext !== context) return
+      browserContext = null
+      activePage = null
+      if (shuttingDown) return
+      browserError = 'Chrome closed unexpectedly. Browser Pilot is attempting to restart it.'
+      logServerEvent('browser-context-closed', { taskId: activeTask?.id })
+      if (activeTask) {
+        activeTask.failureReason = 'Chrome closed unexpectedly. Browser Pilot restarted it; please retry the task.'
+        activeTask.controller.abort()
+      }
+      sendToClients({ type: 'status', status: 'error', error: browserError })
+      scheduleBrowserRestart()
     })
 
-    browserContext.on('page', followPage)
-    const openPages = browserContext.pages()
+    await context.addInitScript('Object.defineProperty(navigator, "webdriver", { get: () => undefined })')
+
+    context.on('page', followPage)
+    const openPages = context.pages()
     if (openPages.length > 0) {
       for (const page of openPages) followPage(page)
     } else {
-      followPage(await browserContext.newPage())
+      followPage(await context.newPage())
     }
 
     if (activePage?.url() === 'about:blank') {
       await activePage.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => undefined)
     }
-    console.log(`Chrome is ready with profile ${profilePath}`)
+    browserRestartAttempts = 0
+    logServerEvent('browser-ready', { profilePath })
     sendToClients({ type: 'status', status: 'connected' })
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     browserError = /executable|chrome|channel/i.test(detail)
       ? 'Google Chrome was not found. Install Google Chrome, then restart Browser Pilot.'
       : `Chrome could not be started: ${detail}`
-    console.error(browserError)
+    if (launchingContext) {
+      if (browserContext === launchingContext) browserContext = null
+      activePage = null
+      await launchingContext.close().catch(() => undefined)
+    }
+    logServerEvent('browser-start-failed', { error: browserError })
     sendToClients({ type: 'status', status: 'error', error: browserError })
+    scheduleBrowserRestart()
+  } finally {
+    browserLaunching = false
   }
 }
 
@@ -698,8 +804,12 @@ async function broadcastSnapshot() {
       image: image.toString('base64'),
       capturedAt: Date.now(),
     })
-  } catch {
-    // A page can close or navigate while its screenshot is being captured.
+  } catch (error) {
+    const now = Date.now()
+    if (now - lastSnapshotErrorAt > 30_000) {
+      lastSnapshotErrorAt = now
+      logServerEvent('snapshot-capture-failed', { error: error instanceof Error ? error.message : String(error) })
+    }
   } finally {
     captureInProgress = false
   }
@@ -715,6 +825,11 @@ server.listen(port, () => {
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
     void (async () => {
+      shuttingDown = true
+      clearInterval(websocketHeartbeat)
+      if (browserRestartTimer) clearTimeout(browserRestartTimer)
+      for (const client of webSocketServer.clients) client.terminate()
+      if (activeTask) activeTask.controller.abort()
       await browserContext?.close().catch(() => undefined)
       server.close(() => process.exit(0))
     })()
