@@ -236,7 +236,7 @@ export async function runAgent(options: AgentOptions) {
 
   for (let number = 1; number <= 40; number += 1) {
     if (signal.aborted) throw new Error('Task stopped by user.')
-    const observation = await observe()
+    const observation = await raceAbort(observe(), signal)
     emit({ type: 'step', description: `Choosing step ${number}`, status: 'thinking', timestamp: Date.now(), step: number })
     const messages: Array<Record<string, unknown>> = [
       {
@@ -251,14 +251,14 @@ export async function runAgent(options: AgentOptions) {
     ]
     let action: BrowserAction
     try {
-      action = await nextAction(settings, messages, signal)
+      action = await raceAbort(nextAction(settings, messages, signal), signal)
     } catch (error) {
       if (signal.aborted) throw new Error('Task stopped by user.')
       emit({ type: 'step', description: error instanceof Error ? error.message : 'Could not get a valid action from the model.', status: 'failed', timestamp: Date.now(), step: number })
       throw error
     }
     if (signal.aborted) throw new Error('Task stopped by user.')
-    let assessment = await assess(action, observation)
+    let assessment = await raceAbort(assess(action, observation), signal)
     if (action.action === 'ask_user' && /\b(sign in|log in)\b/i.test(action.text ?? '') && assessment.loggedIn) {
       const result = 'The page already shows an active account menu. Do not ask the user to sign in; continue with the task.'
       const timestamp = Date.now()
@@ -273,14 +273,14 @@ export async function runAgent(options: AgentOptions) {
         text: 'Please sign in to the website in the browser window, then click Continue here.',
         safety: { level: 'safe', reason: 'The user will complete sign-in directly in the browser; Browser Pilot will not handle credentials.' },
       }
-      assessment = await assess(action, observation)
+      assessment = await raceAbort(assess(action, observation), signal)
     } else if (action.action === 'ask_user' && /\b(password|passcode|one[- ]time code|verification code|login code|credentials?|security code|pin)\b/i.test(action.text ?? '')) {
       action = {
         action: 'ask_user',
         text: 'Please sign in to the website in the browser window, then click Continue here.',
         safety: { level: 'safe', reason: 'The user will complete sign-in directly in the browser; Browser Pilot will not handle credentials.' },
       }
-      assessment = await assess(action, observation)
+      assessment = await raceAbort(assess(action, observation), signal)
     }
     if (action.action !== 'finish' && assessment.critical) {
       const reasons = [assessment.reason, action.safety.level === 'critical' ? action.safety.reason : ''].filter(Boolean)
