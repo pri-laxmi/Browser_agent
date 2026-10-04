@@ -19,6 +19,7 @@ let browserContext: BrowserContext | null = null
 let activePage: Page | null = null
 let browserError: string | null = null
 let captureInProgress = false
+const observedPages = new WeakSet<Page>()
 
 type TaskRecord = { id: string; task: string; status: 'running' | 'completed' | 'failed' | 'stopped'; summary?: string; events: AgentEvent[]; steps: AgentStep[]; createdAt: number; updatedAt: number }
 let taskHistory: TaskRecord[] = []
@@ -29,7 +30,24 @@ let activeTask: {
   answerApproval?: (approved: boolean) => void
 } | null = null
 
-const safetyKeywords = ['pay', 'payment', 'buy now', 'place order', 'checkout', 'purchase', 'subscribe', 'confirm payment', 'delete', 'remove account', 'text', 'post', 'change password', 'card number']
+function safeUrl(value: string) {
+  try {
+    const url = new URL(value)
+    return `${url.origin}${url.pathname}`
+  } catch {
+    return value.slice(0, 200)
+  }
+}
+
+function logServerEvent(event: string, details: Record<string, unknown> = {}) {
+  console.log(`[browser-pilot] ${JSON.stringify({ time: new Date().toISOString(), event, ...details })}`)
+}
+
+function logTaskEvent(task: TaskRecord, event: string, details: Record<string, unknown> = {}) {
+  logServerEvent(event, { taskId: task.id, ...details })
+}
+
+const safetyKeywords = ['pay', 'payment', 'buy now', 'place order', 'checkout', 'purchase', 'subscribe', 'confirm payment', 'delete', 'remove account', 'post', 'change password', 'card number']
 
 function matchingSafetyKeyword(value: string) {
   const normalized = value.replace(/\s+/g, ' ').toLowerCase()
@@ -63,6 +81,12 @@ for (const task of taskHistory) {
 function emitTaskEvent(task: TaskRecord, event: AgentEvent) {
   task.events.push(event)
   task.updatedAt = Date.now()
+  logTaskEvent(task, 'agent-event', {
+    status: event.status,
+    step: event.step,
+    interaction: event.interaction,
+    ...(event.status === 'failed' ? { error: event.description } : {}),
+  })
   sendToClients({ type: 'agent-event', taskId: task.id, event })
   void persistHistory()
 }
@@ -70,7 +94,7 @@ function emitTaskEvent(task: TaskRecord, event: AgentEvent) {
 function validSettings(value: unknown): ModelSettings | null {
   if (!value || typeof value !== 'object') return null
   const candidate = value as Record<string, unknown>
-  if (!['openrouter', 'local'].includes(String(candidate.provider))) return null
+  if (!['openrouter', 'groq', 'local'].includes(String(candidate.provider))) return null
   if (typeof candidate.baseUrl !== 'string' || typeof candidate.model !== 'string' || !candidate.baseUrl.trim() || !candidate.model.trim()) return null
   try {
     const url = new URL(candidate.baseUrl)
@@ -78,7 +102,7 @@ function validSettings(value: unknown): ModelSettings | null {
   } catch {
     return null
   }
-  if (candidate.provider === 'openrouter' && (typeof candidate.apiKey !== 'string' || !candidate.apiKey.trim())) return null
+  if (['openrouter', 'groq'].includes(String(candidate.provider)) && (typeof candidate.apiKey !== 'string' || !candidate.apiKey.trim())) return null
   return {
     provider: candidate.provider as ModelSettings['provider'],
     baseUrl: candidate.baseUrl.trim().replace(/\/+$/, ''),
@@ -95,7 +119,7 @@ app.get('/api/settings', async (_request, response) => {
 function settingsWithSavedKey(value: unknown, saved: ModelSettings | null) {
   if (value && typeof value === 'object') {
     const candidate = value as Record<string, unknown>
-    if (candidate.provider === 'openrouter' && !candidate.apiKey && saved?.provider === 'openrouter' && saved.apiKey) {
+    if (saved && ['openrouter', 'groq'].includes(String(candidate.provider)) && !candidate.apiKey && candidate.provider === saved.provider && saved.apiKey) {
       return validSettings({ ...candidate, apiKey: saved.apiKey })
     }
   }
@@ -106,7 +130,7 @@ app.put('/api/settings', async (request, response) => {
   const saved = await loadJson<ModelSettings | null>(settingsPath, null)
   const settings = settingsWithSavedKey(request.body, saved)
   if (!settings) {
-    response.status(400).json({ error: 'Choose a provider and enter a valid base URL and model. OpenRouter also requires an API key.' })
+    response.status(400).json({ error: 'Choose a provider and enter a valid base URL and model. OpenRouter and Groq also require an API key.' })
     return
   }
   await writeFile(settingsPath, JSON.stringify(settings, null, 2), { mode: 0o600 })
@@ -174,9 +198,11 @@ app.post('/api/tasks', async (request, response) => {
   taskHistory.unshift(record)
   const controller = new AbortController()
   activeTask = { id: record.id, controller }
+  logTaskEvent(record, 'task-started', { provider: settings.provider, model: settings.model })
   await persistHistory()
   response.status(202).json({ id: record.id })
 
+  let observationId = ''
   void runAgent({
     task: taskText,
     settings,
@@ -184,28 +210,49 @@ app.post('/api/tasks', async (request, response) => {
     observe: async () => {
       const page = activePage
       if (!page || page.isClosed()) throw new Error('The active browser page is unavailable.')
-      return page.evaluate(String.raw`(() => {
+      observationId = crypto.randomUUID()
+      const readPage = () => page.evaluate<string>(String.raw`((observationId) => {
         const visible = (element) => {
           const rect = element.getBoundingClientRect()
           const style = getComputedStyle(element)
-          return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) > 0
+          return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.visibility !== 'hidden' && style.display !== 'none' && style.pointerEvents !== 'none' && Number(style.opacity) > 0
         }
+        document.querySelectorAll('[data-browser-pilot-id]').forEach((element) => element.removeAttribute('data-browser-pilot-id'))
         const dismissButtons = [...document.querySelectorAll('button,[role="button"],a')].filter(visible)
         const dismiss = dismissButtons.find((element) => /^(accept all|accept cookies|agree|close|reject all|dismiss|got it|continue without accepting)$/i.test((element.textContent || '').trim()))
         if (dismiss) dismiss.click()
-        const interactive = [...document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],[role="textbox"],[role="combobox"]')].filter(visible).slice(0, 60)
+        const interactive = [...document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],[role="textbox"],[role="combobox"]')].filter((element) => visible(element) && !element.matches(':disabled,[aria-disabled="true"]')).slice(0, 40)
         const items = interactive.map((element, index) => {
           const id = String(index + 1)
-          element.setAttribute('data-browser-pilot-id', id)
+          element.setAttribute('data-browser-pilot-id', observationId + '-' + id)
           const control = element
           const label = control.labels?.[0]?.innerText?.trim() || element.getAttribute('aria-label') || element.getAttribute('title') || (element.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100)
           const details = [control.type, control.name, control.autocomplete].filter(Boolean).join(' ')
-          return id + '. <' + element.tagName.toLowerCase() + '> role=' + (element.getAttribute('role') || '') + ' label=' + JSON.stringify(label) + ' placeholder=' + JSON.stringify(control.placeholder || '') + ' details=' + JSON.stringify(details)
+          const href = element instanceof HTMLAnchorElement ? element.href : ''
+          return id + '. <' + element.tagName.toLowerCase() + '> role=' + (element.getAttribute('role') || '') + ' label=' + JSON.stringify(label) + ' href=' + JSON.stringify(href) + ' placeholder=' + JSON.stringify(control.placeholder || '') + ' details=' + JSON.stringify(details)
         })
-        return 'URL: ' + location.href + '\nTitle: ' + document.title + '\nVisible text:\n' + (document.body.innerText || '').slice(0, 7000) + '\nVisible interactive elements:\n' + items.join('\n')
-      })()`)
+        const bodyText = document.body?.innerText || document.documentElement?.innerText || ''
+        return 'URL: ' + location.href + '\nTitle: ' + document.title + '\nVisible text:\n' + bodyText.slice(0, 4500) + '\nVisible interactive elements:\n' + items.join('\n')
+      })(${JSON.stringify(observationId)})`)
+      let observation: string
+      try {
+        observation = await readPage()
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (!/execution context was destroyed|cannot find context|frame was detached/i.test(message)) throw error
+        logTaskEvent(record, 'observation-retry-after-navigation', { error: message })
+        await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => undefined)
+        await page.waitForTimeout(250)
+        observation = await readPage()
+      }
+      const url = observation.match(/^URL: (.+)$/m)?.[1] ?? page.url()
+      const title = observation.match(/^Title: (.+)$/m)?.[1] ?? ''
+      const elementCount = observation.match(/^Visible interactive elements:\n([\s\S]*)$/m)?.[1]
+        .split('\n').filter(Boolean).length ?? 0
+      logTaskEvent(record, 'page-observed', { url: safeUrl(url), title: title.slice(0, 120), interactiveElements: elementCount })
+      return observation
     },
-    assess: async (action: BrowserAction, observation: string) => {
+    assess: async (action: BrowserAction) => {
       const page = activePage
       if (!page || page.isClosed()) throw new Error('The active browser page is unavailable.')
       let target = action.action.replaceAll('_', ' ')
@@ -228,11 +275,11 @@ app.post('/api/tasks', async (request, response) => {
         return hasSignOut || (hasAccountMenu && !hasSignIn)
       })()`))
       if (action.action === 'click' || action.action === 'type_text') {
-        const details = await page.evaluate((elementId) => {
-          const element = document.querySelector(`[data-browser-pilot-id="${elementId}"]`)
-          if (!element) return null
-          const input = element as HTMLInputElement
-          const form = element.closest('form')
+        const details = await page.evaluate(({ observationId, element }) => {
+          const target = document.querySelector(`[data-browser-pilot-id="${observationId}-${element}"]`)
+          if (!target) return null
+          const input = target as HTMLInputElement
+          const form = target.closest('form')
           const credentialForm = Boolean(form?.querySelector('input[type="password"],input[autocomplete="current-password"]'))
           const label = input.labels?.[0]?.innerText?.trim()
           const fieldDetails = `${input.name} ${input.placeholder} ${input.id} ${input.autocomplete} ${label}`
@@ -244,30 +291,28 @@ app.post('/api/tasks', async (request, response) => {
             /pass(word|code)?|one[-_ ]time|verification[-_ ]code|security[-_ ]code|\botp\b|\bpin\b/i.test(fieldDetails)
           )
           const loginForm = credentialForm || (usernameField && Boolean(document.querySelector('input[type="password"],input[autocomplete="current-password"]')))
-          const context = element.closest('label,form,[role="group"],li')?.textContent?.trim()
           const descriptor = [
-            element.tagName.toLowerCase(),
-            element.getAttribute('type'),
-            element.getAttribute('name'),
-            element.getAttribute('autocomplete'),
+            target.tagName.toLowerCase(),
+            target.getAttribute('type'),
+            target.getAttribute('name'),
+            target.getAttribute('autocomplete'),
             label,
-            element.getAttribute('aria-label'),
-            element.getAttribute('placeholder'),
-            element.getAttribute('title'),
-            element.textContent?.trim(),
-            context,
+            target.getAttribute('aria-label'),
+            target.getAttribute('placeholder'),
+            target.getAttribute('title'),
+            target.textContent?.trim(),
           ].filter(Boolean).join(' ').replace(/\s+/g, ' ').slice(0, 500)
           return { descriptor, credentialField, loginForm }
-        }, action.element)
+        }, { observationId, element: action.element })
         if (details) {
           target = details.descriptor
           requiresLogin = (action.action === 'type_text' && details.credentialField) ||
             (action.action === 'click' && (details.loginForm || (!loggedIn && /\b(sign in|log in)\b/i.test(details.descriptor))))
         }
       } else if (action.action === 'press_key') {
-        requiresLogin = await page.evaluate(String.raw`(() => {
+        const focusedDetails = await page.evaluate<{ requiresLogin: boolean; descriptor: string }>(String.raw`(() => {
           const element = document.activeElement
-          if (!element) return false
+          if (!element) return { requiresLogin: false, descriptor: '' }
           const input = element
           const formHasPassword = Boolean(element.closest('form')?.querySelector('input[type="password"],input[autocomplete="current-password"]'))
           const fieldDetails = [
@@ -277,8 +322,22 @@ app.post('/api/tasks', async (request, response) => {
             input.autocomplete,
             input.labels?.[0]?.innerText,
           ].filter(Boolean).join(' ')
-          return formHasPassword || /password|passcode|one[-_ ]time|verification[-_ ]code|security[-_ ]code|\botp\b|\bpin\b/i.test(fieldDetails)
+          const descriptor = [
+            element.tagName.toLowerCase(),
+            element.getAttribute('type'),
+            element.getAttribute('name'),
+            element.getAttribute('aria-label'),
+            element.getAttribute('placeholder'),
+            element.labels?.[0]?.innerText,
+            element.textContent?.trim(),
+          ].filter(Boolean).join(' ').replace(/\s+/g, ' ').slice(0, 500)
+          return {
+            requiresLogin: formHasPassword || /password|passcode|one[-_ ]time|verification[-_ ]code|security[-_ ]code|\botp\b|\bpin\b/i.test(fieldDetails),
+            descriptor,
+          }
         })()`)
+        requiresLogin = focusedDetails.requiresLogin
+        target = focusedDetails.descriptor || target
         if (requiresLogin) target = 'the focused login or verification field'
       } else if (action.action === 'go_to_url') {
         target = action.url ?? 'the requested website'
@@ -286,16 +345,15 @@ app.post('/api/tasks', async (request, response) => {
       if (action.action === 'ask_user' || action.action === 'finish') {
         return { critical: false, reason: '', target, requiresLogin, loggedIn }
       }
-      const pageContent = await page.locator('body').innerText({ timeout: 8_000 })
-      const keywordInTarget = matchingSafetyKeyword(target)
-      const keywordInPage = matchingSafetyKeyword(pageContent || observation)
+      const canHaveConsequentialSideEffect = ['click', 'type_text', 'press_key'].includes(action.action)
+      const keywordInTarget = canHaveConsequentialSideEffect ? matchingSafetyKeyword(target) : undefined
       const sensitiveCardField = /(?:cc[-_]?number|card[\s_-]*number)/i.test(target)
-      const matchedKeyword = keywordInTarget ?? keywordInPage
-      const critical = Boolean(matchedKeyword || sensitiveCardField)
+      const matchedKeyword = keywordInTarget
+      const critical = Boolean(canHaveConsequentialSideEffect && (matchedKeyword || sensitiveCardField))
       const reason = sensitiveCardField
         ? 'The target is a payment-card number field.'
         : matchedKeyword
-          ? `The runtime safety rule matched "${matchedKeyword}" in the ${keywordInTarget ? 'target element' : 'page content'}.`
+          ? `The runtime safety rule matched "${matchedKeyword}" in the target element.`
           : ''
       return { critical, reason, target, requiresLogin, loggedIn }
     },
@@ -342,38 +400,69 @@ app.post('/api/tasks', async (request, response) => {
     execute: async (action: BrowserAction) => {
       const page = activePage
       if (!page || page.isClosed()) throw new Error('The active browser page is unavailable.')
+      const actionDetails: Record<string, unknown> = { action: action.action }
+      if (action.element !== undefined) actionDetails.element = action.element
+      if (action.action === 'go_to_url' && action.url) actionDetails.url = safeUrl(action.url)
+      if (action.action === 'press_key' && action.key) actionDetails.key = action.key
+      if (action.action === 'type_text') actionDetails.text = '[redacted]'
+      if (action.action === 'scroll') actionDetails.direction = action.direction ?? 'down'
+      logTaskEvent(record, 'action-started', actionDetails)
       if (action.action === 'go_to_url') {
         const target = new URL(action.url!)
         if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Only HTTP and HTTPS URLs are allowed.')
         await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 })
-        return `Navigated to ${page.url()}`
+        const result = `Navigated to ${page.url()}`
+        logTaskEvent(record, 'action-succeeded', { action: action.action, url: safeUrl(page.url()) })
+        return result
       }
       if (action.action === 'click' || action.action === 'type_text') {
-        const locator = page.locator(`[data-browser-pilot-id="${action.element}"]`).first()
-        if (await locator.count() === 0) throw new Error(`Visible element ${action.element} is missing; inspect the current page again.`)
+        const selector = `[data-browser-pilot-id="${observationId}-${action.element}"]`
+        const locator = page.locator(selector)
+        const count = await locator.count()
+        if (count !== 1) throw new Error(`Element ${action.element} from the latest page inspection is ${count === 0 ? 'no longer available' : 'ambiguous'}; inspect the current page again.`)
         if (action.action === 'click') {
-          await locator.click({ timeout: 8_000 })
+          try {
+            await locator.click({ timeout: 8_000 })
+          } catch (error) {
+            const blocker = await page.evaluate((targetSelector) => {
+              const target = document.querySelector(targetSelector)
+              if (!target) return null
+              const rect = target.getBoundingClientRect()
+              const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+              if (!hit || hit === target || target.contains(hit)) return null
+              const label = hit.getAttribute('aria-label') || hit.getAttribute('title') || (hit as HTMLElement).innerText?.trim().replace(/\s+/g, ' ').slice(0, 120)
+              return `<${hit.tagName.toLowerCase()}>${hit.getAttribute('role') ? ` role=${hit.getAttribute('role')}` : ''}${label ? ` "${label}"` : ''}`
+            }, selector)
+            if (blocker) throw new Error(`Click was blocked by ${blocker}. Inspect the current page and choose a visible control to dismiss or handle it.`)
+            throw error
+          }
+          logTaskEvent(record, 'action-succeeded', { action: action.action, element: action.element })
           return `Clicked element ${action.element}.`
         }
         await locator.fill(action.text!, { timeout: 8_000 })
         if (action.pressEnter) await locator.press('Enter', { timeout: 5_000 })
+        logTaskEvent(record, 'action-succeeded', { action: action.action, element: action.element, text: '[redacted]', pressEnter: Boolean(action.pressEnter) })
         return `Entered text in element ${action.element}${action.pressEnter ? ' and pressed Enter' : ''}.`
       }
       if (action.action === 'press_key') {
         await page.keyboard.press(action.key!)
+        logTaskEvent(record, 'action-succeeded', { action: action.action, key: action.key })
         return `Pressed ${action.key}.`
       }
       if (action.action === 'scroll') {
         await page.evaluate(({ direction, amount }) => window.scrollBy({ top: (direction === 'up' ? -1 : 1) * amount, behavior: 'instant' }), { direction: action.direction ?? 'down', amount: Math.min(1600, Math.max(100, action.amount ?? 600)) })
+        logTaskEvent(record, 'action-succeeded', { action: action.action, direction: action.direction ?? 'down' })
         return `Scrolled ${action.direction ?? 'down'}.`
       }
       if (action.action === 'wait') {
         await page.waitForTimeout(Math.min(10_000, Math.max(100, (action.seconds ?? 1) * 1000)))
+        logTaskEvent(record, 'action-succeeded', { action: action.action, seconds: Math.min(10, Math.max(0.1, action.seconds ?? 1)) })
         return `Waited ${Math.min(10, Math.max(0.1, action.seconds ?? 1))} seconds.`
       }
       if (action.action === 'extract_text') {
         const extracted = await page.locator('body').innerText({ timeout: 8_000 })
-        return `Extracted page text: ${extracted.slice(0, 12_000)}`
+        logTaskEvent(record, 'action-succeeded', { action: action.action, characters: extracted.length })
+        return `Extracted page text: ${extracted.slice(0, 3_500)}${extracted.length > 3_500 ? '\n[Page text truncated; scroll or inspect a relevant section for more.]' : ''}`
       }
       if (action.action === 'ask_user') {
         const isLogin = /\b(sign in|log in)\b/i.test(action.text ?? '')
@@ -423,6 +512,7 @@ app.post('/api/tasks', async (request, response) => {
     record.updatedAt = Date.now()
     await persistHistory()
     if (activeTask?.id === record.id) activeTask = null
+    logTaskEvent(record, 'task-finished', { status: record.status, durationMs: record.updatedAt - record.createdAt })
     sendToClients({ type: 'task-finished', taskId: record.id, status: record.status, summary: record.summary })
   })
 })
@@ -476,8 +566,35 @@ function sendToClients(payload: Record<string, unknown>) {
 }
 
 function followPage(page: Page) {
+  if (observedPages.has(page)) return
+  observedPages.add(page)
   activePage = page
+  page.on('framenavigated', (frame) => {
+    if (frame !== page.mainFrame()) return
+    logServerEvent('page-navigated', { url: safeUrl(frame.url()), taskId: activeTask?.id })
+  })
+  page.on('console', (message) => {
+    if (message.type() !== 'error') return
+    logServerEvent('page-console-error', {
+      taskId: activeTask?.id,
+      url: safeUrl(page.url()),
+      message: message.text().slice(0, 500),
+    })
+  })
+  page.on('pageerror', (error) => {
+    logServerEvent('page-error', { taskId: activeTask?.id, url: safeUrl(page.url()), error: error.message.slice(0, 1000) })
+  })
+  page.on('requestfailed', (request) => {
+    logServerEvent('request-failed', {
+      taskId: activeTask?.id,
+      method: request.method(),
+      resourceType: request.resourceType(),
+      url: safeUrl(request.url()),
+      error: request.failure()?.errorText,
+    })
+  })
   page.on('close', () => {
+    logServerEvent('page-closed', { taskId: activeTask?.id, url: safeUrl(page.url()) })
     if (activePage !== page) return
     const remainingPages = browserContext?.pages() ?? []
     activePage = remainingPages.at(-1) ?? null
