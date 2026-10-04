@@ -9,7 +9,7 @@ Browser Pilot connects a React shell to an installed, headed Chrome session, str
 
 The server launches Chrome with a persistent profile at `server/.browser-profile/`. Logins and browser data stay on that machine; the profile is ignored by Git. Run only one Browser Pilot server against this profile at a time.
 
-Configure a model from **Settings** in the app. OpenRouter uses `https://openrouter.ai/api/v1`, a model name, and an API key. Local Ollama or LM Studio uses its OpenAI-compatible `/v1` URL, model name, and no key. Model settings and task history are stored in the git-ignored `server/.browser-pilot-settings.json` and `server/.browser-pilot-history.json` files.
+Configure a model from **Settings** in the app. Groq uses `https://api.groq.com/openai/v1`, a supported model name (the default is `llama-3.3-70b-versatile`), and a Groq API key. OpenRouter uses `https://openrouter.ai/api/v1`, a model name, and an OpenRouter API key. Local Ollama or LM Studio uses its OpenAI-compatible `/v1` URL, model name, and no key. Model settings and task history are stored in the git-ignored `server/.browser-pilot-settings.json` and `server/.browser-pilot-history.json` files.
 
 ## Start Developing
 
@@ -40,6 +40,10 @@ Browser Pilot workspace
 
 - The root `package.json` runs the server and Vite concurrently with `npm run dev`.
 - `server/src/index.ts` starts Express and a WebSocket server on the same HTTP server. Playwright launches the installed Chrome channel in headed mode, using the project-local persistent profile.
+- The server terminal prints timestamped JSON diagnostics for task steps, page inspections, actions, navigation, browser console/page errors, and failed requests. Typed text and API keys are not included in action logs.
+- Model requests automatically retry once after a rate-limit response, waiting at least 22 seconds or the provider's longer retry delay. Stopping the task cancels the wait.
+- Browser observations and recent action history are bounded before being sent to the model to avoid oversized prompts on long shopping/search pages; model-request logs report message count and prompt character count without printing prompt contents.
+- Routine browsing, including navigation, search, scrolling, waiting, and reading page text, does not require approval. Approval is reserved for runtime-detected consequential controls or fields such as payment, purchase, subscription, deletion, account removal, posting, and password changes; unrelated words elsewhere on the page do not trigger it.
 - The server follows newly opened tabs and streams the newest active page as JPEG frames about every 400 ms (roughly 2.5 frames per second), together with the current URL, title, and capture time. Frames are sent only while at least one WebSocket client is connected.
 - `web/src/BrowserPilot.tsx` renders the app shell and live frame. It reconnects to the WebSocket with increasing delays when the connection drops and shows connecting, connected, disconnected, and error states.
 - `server/src/agent.ts` uses plain `fetch` chat-completion requests with one browser-action tool per turn. Each action requires a model-provided safe/critical classification and reason; runtime keyword checks independently inspect the target and observed page text. Critical actions wait for explicit approval in the app and are never auto-approved.
